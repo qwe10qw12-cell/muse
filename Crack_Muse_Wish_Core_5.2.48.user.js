@@ -1,7 +1,8 @@
 // ==UserScript==
 // @name         ✨ Crack Muse Writer (AI 답변 커스텀)
 // @namespace    muse writer
-// @version      5.2.48
+// @version      5.2.49
+// @downloadURL  none
 // @description  Muse 집필·PC 캐해 위임 토글·Core AI 선별 번역 + Wish RP Core 저장 기억·자료 읽기 전용 참고 (Core 1.5.2 호환)
 // @author       user
 // @match        https://crack.wrtn.ai/*
