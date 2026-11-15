@@ -1,7 +1,7 @@
 // ==UserScript==
 // @name         ✨ Crack Muse Writer (AI 답변 커스텀)
 // @namespace    muse writer
-// @version      5.3.92
+// @version      5.3.93
 // @description  Muse 집필·PC 캐해 위임·PC 입체 해석(겉/속/작동)·Core 선별 모델 선택·Wish RP Core 저장 기억·자료 읽기 전용 참고 (Core 1.5.2 호환)
 // @author       user
 // @match        https://crack.wrtn.ai/*
@@ -167,14 +167,15 @@
   // 5.3.23 hybrid speed guards: keep 5.3.19 fast-selection architecture,
   // but cap pathological waits and automatic Core payload growth using the 5.3.18 guard values.
   const MUSE_REQUEST_LIMITS = {sdkPreparation:30000,selection:45000,translation:90000,writer:120000};
-  // Gemini 4 Argon can take several minutes; only this model receives an extended deadline.
+  // Gemini 4 Argon/Carbon share the existing extended request deadline.
   const MUSE_ARGON_REQUEST_TIMEOUT = 1200000;
   const MUSE_ARGON_OUTPUT_TOKENS = 32768; // Non-streaming REST request cap; never set higher without continuation.
   function isMuseArgon(model) { return normalizeModelId(model) === "gemini-4-argon"; }
+  function isMuseArgonOrCarbon(model) { return isMuseArgon(model) || normalizeModelId(model) === "gemini-4-carbon"; }
   function isMuseThinkingLevelModel(model) { return /^gemini-[34](?:[.-]|$)/.test(normalizeModelId(model)); }
   function museArgonGenerationConfig(model, config = {}) {
-    if (!isMuseArgon(model)) return config;
-    // Gemini 4 Argon ignores sampling controls and rejects several older settings.
+    if (!isMuseArgonOrCarbon(model)) return config;
+    // Gemini 4 Argon/Carbon use the same capped output and thinking-level request settings.
     const cleaned = {...config};
     for (const k of ["temperature","topP","topK","candidateCount","frequencyPenalty","presencePenalty"]) delete cleaned[k];
     cleaned.maxOutputTokens = MUSE_ARGON_OUTPUT_TOKENS;
@@ -385,7 +386,7 @@
   // thinking setting and tiny prompt keep actual generation small.
   function museFirebaseTestGenerationConfig(model) {
     return {
-      maxOutputTokens:isMuseArgon(model) ? MUSE_ARGON_OUTPUT_TOKENS : 4096,
+      maxOutputTokens:isMuseArgonOrCarbon(model) ? MUSE_ARGON_OUTPUT_TOKENS : 4096,
       thinkingConfig:isMuseThinkingLevelModel(model)
         ? {thinkingLevel:normalizeThinkingLevel(model,"low")}
         : {thinkingBudget:256},
@@ -466,7 +467,7 @@
       } else states[1]="건너뜀 (디버그 토큰 미설정)";
       stage=2;states[2]="진행 중";show("선택한 모델로 최소 요청을 보내고 있어요.");
       const ai=major>=12?sdk.getAI(app,{backend:new sdk.VertexAIBackend("global")}):sdk.getVertexAI(app);
-      const testTimeout=isMuseArgon(model) ? MUSE_ARGON_REQUEST_TIMEOUT : 60000;
+      const testTimeout=isMuseArgonOrCarbon(model) ? MUSE_ARGON_REQUEST_TIMEOUT : 60000;
       const gemini=sdk.getGenerativeModel(ai,{model,generationConfig:museFirebaseTestGenerationConfig(model)}, {timeout:testTimeout});
       const result=await withDeadline(()=>gemini.generateContent("Reply only with the word OK.",{timeout:testTimeout}),testTimeout+5000);
       checkRoom();
@@ -529,7 +530,7 @@
     return text;
   }
 
-  const MUSE_DIAGNOSTIC_VERSION = "5.3.92";
+  const MUSE_DIAGNOSTIC_VERSION = "5.3.93";
   const museDiagnosticRuns = new Map();
   function museDiagnosticText(value) {
     let text = String(value ?? "").split(/[\r\n]/)[0];
@@ -564,7 +565,8 @@
   }
   function museDiagnosticBegin(operation) {
     const run = {scope:operation.scope,startedAt:Date.now(),status:"진행 중",events:[],requests:0,
-      stages:operation.timing.stages,mode:GM_getValue(getTransConfigKey("mode"),"only"),selection:readCoreSelectionSettings(),
+      stages:operation.timing.stages,mode:GM_getValue(getTransConfigKey("mode"),"only"),
+      dialogueTranslationEnabled:isMuseDialogueTranslationEnabled(operation.room),selection:readCoreSelectionSettings(),
       coreEnabled:isWishCoreReferenceEnabled()};
     operation.diagnosticRun = run;
     museDiagnosticRuns.set(operation.scope,run);
@@ -602,7 +604,7 @@
   }
   function museDiagnosticReport(run) {
     const seconds=ms=>(Math.max(0,ms)/1000).toFixed(1)+"초";
-    const lines=[`Muse ${MUSE_DIAGNOSTIC_VERSION} 진단`, `작업: ${run.mode==="write"?"집필 후 번역":"번역만"} · ${run.status}`,
+    const lines=[`Muse ${MUSE_DIAGNOSTIC_VERSION} 진단`, `작업: ${run.mode==="write"?(run.dialogueTranslationEnabled ? "집필 후 번역" : "한국어 집필만"):"번역만"} · ${run.status}`,
       `Core 반영: ${run.coreEnabled?"ON":"OFF"} · 관련성 ${run.selection.relevance?"ON":"OFF"} · 우선순위 ${run.selection.priority?"ON":"OFF"} · 자동 후보 ${run.selection.autoCandidates?"ON":"OFF"}`];
     for (const [label,ms] of run.stages) lines.push(`${label}: ${seconds(ms)}`);
     lines.push(`전체: ${seconds((run.finishedAt ?? Date.now())-run.startedAt)}`);
@@ -872,6 +874,7 @@
     "deepseek-v4-flash": { input: 0.14, output: 0.28, cacheRead: 0.0028, cacheWrite: 0.14 },
     "deepseek-v4-pro": { input: 0.435, output: 0.87, cacheRead: 0.003625, cacheWrite: 0.435 },
   };
+  MODEL_PRICING["gemini-4-carbon"] = MODEL_PRICING["gemini-4-argon"]; // Same introductory tariff.
 
   const MODEL_ID_MIGRATIONS = {
     "gemini-3.1-flash-lite-preview": "gemini-3.1-flash-lite",
@@ -884,7 +887,7 @@
 
   function normalizeThinkingLevel(modelId, level) {
     const model = normalizeModelId(modelId);
-    const supportsLowToHighOnly = isMuseArgon(model) || model === "gemini-3.8-flash" || model === "gemini-3.7-flash" || model === "gemini-3.1-pro-preview";
+    const supportsLowToHighOnly = isMuseArgonOrCarbon(model) || model === "gemini-3.8-flash" || model === "gemini-3.7-flash" || model === "gemini-3.1-pro-preview";
     const allowed = supportsLowToHighOnly
       ? ["low", "medium", "high"]
       : ["minimal", "low", "medium", "high"];
@@ -896,6 +899,7 @@
   const PROVIDER_MODEL_OPTIONS = {
     google: [
       ["gemini-4-argon", "Gemini 4 Argon"],
+      ["gemini-4-carbon", "Gemini 4 Carbon"],
       ["gemini-3.8-flash", "Gemini 3.8 Flash"],
       ["gemini-3.7-flash", "Gemini 3.7 Flash"],
       ["gemini-3.5-flash", "Gemini 3.5 Flash"],
@@ -906,6 +910,7 @@
     ],
     firebase: [
       ["gemini-4-argon", "Gemini 4 Argon"],
+      ["gemini-4-carbon", "Gemini 4 Carbon"],
       ["gemini-3.8-flash", "Gemini 3.8 Flash"],
       ["gemini-3.7-flash", "Gemini 3.7 Flash"],
       ["gemini-3.5-flash", "Gemini 3.5 Flash"],
@@ -1208,11 +1213,11 @@
     if (!u) return null;
 
     const modelIdRaw = u.model || modelOverride;
-    // Argon's introductory tariff ends on 2026-11-30. Compute the active rate at usage time.
-    const argonPrice = Date.now() >= Date.parse("2026-12-01T00:00:00Z")
+    // Argon and Carbon share the introductory tariff through Nov 30, 2026 (UTC).
+    const gemini4Price = Date.now() >= Date.parse("2026-12-01T00:00:00Z")
       ? {input:4,output:20,cacheRead:0.2,cacheWrite:4} : MODEL_PRICING["gemini-4-argon"];
-    const pricing = isMuseArgon(modelIdRaw) || isMuseArgon(modelOverride) && !MODEL_PRICING[modelIdRaw]
-      ? argonPrice : MODEL_PRICING[modelIdRaw] || MODEL_PRICING[modelOverride] || MODEL_PRICING["gemini-3.5-flash"];
+    const pricing = isMuseArgonOrCarbon(modelIdRaw) || isMuseArgonOrCarbon(modelOverride) && !MODEL_PRICING[modelIdRaw]
+      ? gemini4Price : MODEL_PRICING[modelIdRaw] || MODEL_PRICING[modelOverride] || MODEL_PRICING["gemini-3.5-flash"];
     if (!pricing) return null;
 
     const thoughtsTokens = u.thoughtsTokenCount || 0;
@@ -1278,6 +1283,11 @@
 
   function getTransConfigKey(kind, room = getChatRoomId()) {
     return `cmwTrans_${kind}_${room}`;
+  }
+
+  // Legacy rooms default ON: existing translation behavior stays unchanged.
+  function isMuseDialogueTranslationEnabled(room = getChatRoomId()) {
+    return GM_getValue(getTransConfigKey("dialogueTranslationEnabled", room), true) !== false;
   }
 
   // Old Muse setting keys are copied once; existing rules are never discarded.
@@ -2421,8 +2431,8 @@ ${JSON.stringify({kind:"rp_user_note",content})}` : "";
         : { value: "on", label: "ON · High", note: "긴 기억·코어 선별과 연속성 판단에 추론 권장" };
     }
     if (isMuseThinkingLevelModel(modelId)) {
-      const isPro = isMuseArgon(modelId) || modelId.includes("pro");
-      const supportsMinimal = !isMuseArgon(modelId) && modelId !== "gemini-3.8-flash" && modelId !== "gemini-3.7-flash";
+      const isPro = isMuseArgonOrCarbon(modelId) || modelId.includes("pro");
+      const supportsMinimal = !isMuseArgonOrCarbon(modelId) && modelId !== "gemini-3.8-flash" && modelId !== "gemini-3.7-flash";
       let level;
       if (isPro) level = tokens <= 20000 ? "low" : tokens <= 80000 ? "medium" : "high";
       else if (supportsMinimal) level = tokens <= 12000 ? "minimal" : tokens <= 45000 ? "low" : tokens <= 100000 ? "medium" : "high";
@@ -3452,7 +3462,7 @@ ${JSON.stringify({kind:"rp_user_note",content})}` : "";
   panel.id = "crack-ai-panel";
   panel.innerHTML = `
         <div class="panel-header" id="panel-drag-handle">
-            <div class="panel-title">✳ MUSE WRITER <span class="cmw-ver">V5.3.90 · 번역 지침 프리셋</span></div>
+            <div class="panel-title">✳ MUSE WRITER <span class="cmw-ver">V5.3.93 · 대사 번역 ON/OFF</span></div>
             <div class="cmw-live"><i></i><span id="cmw-live-token">—</span></div>
             <button type="button" class="cmw-help-btn" id="cmw-help-btn" aria-label="Muse 사용 방법" aria-expanded="false">?</button>
             <div class="panel-close" id="close-panel">✕</div>
@@ -3460,10 +3470,10 @@ ${JSON.stringify({kind:"rp_user_note",content})}` : "";
         <div class="cmw-help-pop" id="cmw-help-pop" hidden>
             <div class="cmw-help-head"><b>Muse 사용 방법</b><button type="button" class="cmw-help-close" id="cmw-help-close" aria-label="도움말 닫기">×</button></div>
             <div class="cmw-help-list">
-                <div class="cmw-help-item"><b>마법 버튼</b><span>짧게 누르면 번역 탭에서 선택한 방식으로 실행해요. 번역만은 바로 번역하고, 집필 후 번역은 Core 선별 뒤 한국어 본문을 집필하고 별도 요청에서 대사만 번역해요. 0.55초 길게 누르면 설정창을 열어요. 생성 중에도 길게 눌러 설정을 볼 수 있어요.</span></div>
+                <div class="cmw-help-item"><b>마법 버튼</b><span>짧게 누르면 번역 탭에서 선택한 방식으로 실행해요. 집필 후 번역에서 대사 번역을 OFF로 두면 한국어 본문만 집필하고 번역 요청을 보내지 않아요. 번역만 + OFF에서는 실행할 작업이 없어요. 0.55초 길게 누르면 설정창을 열어요. 생성 중에도 길게 눌러 설정을 볼 수 있어요.</span></div>
                 <div class="cmw-help-item"><b>홈</b><span>현재 모델·입력 토큰·프로필을 확인하고 다듬기·능동성·분량과 참고 자료 반영을 빠르게 조절해요.</span></div>
                 <div class="cmw-help-item"><b>집필</b><span>다듬기, 능동성, 출력 분량, 시점과 문체를 설정해요. 입력칸이 비어 있어도 능동성은 적용돼요.</span></div>
-                <div class="cmw-help-item"><b>번역</b><span>입력한 대사만 목표 언어로 번역하거나, 먼저 Muse로 집필한 뒤 번역해요. 번역 지침 프리셋을 선택·추가·편집할 수 있어요. 별표 안 서술은 한국어로 유지돼요.</span></div>
+                <div class="cmw-help-item"><b>번역</b><span>대사 번역 ON은 기존대로 목표 언어로 번역하고, OFF에서는 집필 후 번역 방식을 한국어 집필 전용으로 사용해요. 설정은 방별로 저장돼요. 번역 지침 프리셋은 ON에서만 적용돼요.</span></div>
                 <div class="cmw-help-item"><b>분위기</b><span>감정·장르·연출을 중복 선택해 장면에 어울리는 분위기를 더해요.</span></div>
                 <div class="cmw-help-item"><b>서사</b><span>장기 방향·이번 흐름·속도·피할 전개를 정하고, 상담 AI와 방향을 함께 다듬어요.</span></div>
                 <div class="cmw-help-item"><b>설정집</b><span>독립적으로 반영하는 대화 프로필·유저 노트, PC 추가 설정과 겉/속 입체 해석, 커스텀 규칙·OOC 단축어와 세계관 사전을 관리해요.</span></div>
@@ -3599,13 +3609,18 @@ ${JSON.stringify({kind:"rp_user_note",content})}` : "";
                 </div>
             </div>
                 <div class="cmw-pane" id="pane-trans">
-                <div class="cmw-page-head"><span class="g">◎</span><h3>유저 입력 번역</h3><p>대사만 번역 · 별표 안 서술은 한국어 유지</p></div>
+                <div class="cmw-page-head"><span class="g">◎</span><h3>유저 입력 번역</h3><p>대사 번역 ON/OFF · 한국어 집필만 가능</p></div>
                 <div class="setting-group trans-wide">
                     <span class="setting-label" style="color:#64aef0;">번역 실행 방식</span>
                     <div class="choice-group">
                         <label><input type="radio" name="cfg-trans-mode" value="only" checked> 번역만</label>
                         <label><input type="radio" name="cfg-trans-mode" value="write"> 집필 후 번역</label>
                     </div>
+                    <div class="setting-label-row" style="margin-top:10px;">
+                        <label class="setting-label" for="cfg-dialogue-translation-enabled">대사 번역</label>
+                        <label class="ref-switch"><input type="checkbox" id="cfg-dialogue-translation-enabled" checked> <span id="cfg-dialogue-translation-state">ON</span></label>
+                    </div>
+                    <div class="cmw-audit-note">OFF + 집필 후 번역: 한국어로만 집필하고 번역 AI를 호출하지 않아요. 번역만 + OFF: 실행하지 않아요. 기본값은 ON이며 방별로 기억해요.</div>
                     <div class="cmw-trans-flow-row"><div id="trans-mode-desc" class="ego-desc">입력한 문장을 그대로 목표 언어로 번역해요.</div><button type="button" class="cmw-inline-help" id="trans-flow-help-btn" aria-label="번역 실행 순서와 API 호출 횟수 도움말" aria-expanded="false">?</button></div>
                     <button type="button" class="btn-save cmw-trans-run" id="cmw-trans-run">입력창 번역 실행</button>
                     <div id="cmw-trans-status" class="ego-desc" role="status" aria-live="polite">Muse 버튼을 짧게 누르거나 위 실행 버튼으로 번역해요. 전송은 직접 눌러 주세요.</div>
@@ -3936,6 +3951,7 @@ ${JSON.stringify({kind:"rp_user_note",content})}` : "";
                     <span class="setting-label">① PC 집필 · AI 모델 선택</span>
                     <select id="cfg-model" class="expand-input">
                         <option value="gemini-4-argon">Gemini 4 Argon</option>
+                        <option value="gemini-4-carbon">Gemini 4 Carbon</option>
                         <option value="gemini-3.8-flash">Gemini 3.8 Flash</option>
                         <option value="gemini-3.7-flash">Gemini 3.7 Flash</option>
                         <option value="gemini-3.5-flash">Gemini 3.5 Flash</option>
@@ -4134,7 +4150,7 @@ ${JSON.stringify({kind:"rp_user_note",content})}` : "";
     if (isNaN(savedBudget) || savedBudget < 128) savedBudget = 1024;
 
     if (isMuseThinkingLevelModel(currentModel)) {
-      const minimalOption = isMuseArgon(currentModel) || currentModel === "gemini-3.8-flash" || currentModel === "gemini-3.7-flash" || currentModel === "gemini-3.1-pro-preview"
+      const minimalOption = isMuseArgonOrCarbon(currentModel) || currentModel === "gemini-3.8-flash" || currentModel === "gemini-3.7-flash" || currentModel === "gemini-3.1-pro-preview"
         ? ""
         : `<option value="minimal" ${savedLevel === "minimal" ? "selected" : ""}>Minimal</option>`;
       container.innerHTML = `
@@ -5029,7 +5045,7 @@ ${JSON.stringify({kind:"rp_user_note",content})}` : "";
     const coreN = isWishCoreReferenceEnabled() ? (getWishCoreReferenceMode() === "all" ? "전체" : selectedWishCoreKeys().size) : "OFF";
     box.innerHTML = [
       `<button class="sum-chip" data-goto="pane-write">${readPcDelegationSettings().enabled ? "캐해 위임 <b>ON</b>" : "다듬기 <b>" + GM_getValue("cfgRewrite", 2) + "</b>"} · 능동 <b>${GM_getValue("cfgActive", 2)}</b></button>`,
-      `<button class="sum-chip" data-goto="pane-trans">번역 <b>${GM_getValue(getTransConfigKey("mode"), "only") === "write" ? "집필 후" : "번역만"}</b> · ${getTargetLang()}</button>`,
+      `<button class="sum-chip" data-goto="pane-trans">${isMuseDialogueTranslationEnabled() ? `번역 <b>${GM_getValue(getTransConfigKey("mode"), "only") === "write" ? "집필 후" : "번역만"}</b> · ${getTargetLang()}` : `대사 번역 <b>OFF</b> · ${GM_getValue(getTransConfigKey("mode"), "only") === "write" ? "한국어 집필" : "번역만 비활성"}`}</button>`,
       tones.length ? `<button class="sum-chip" data-goto="pane-mood">${tones.slice(0, 2).join(" · ")}${tones.length > 2 ? " +" + (tones.length - 2) : ""}</button>` : "",
       `<button class="sum-chip" data-goto="pane-compass">나침반 <b>${c.enabled ? "ON" : "OFF"}</b></button>`,
       `<button class="sum-chip" data-goto="pane-core">프로필 <b>${isChatProfileReferenceEnabled() ? "ON" : "OFF"}</b> · 유저노트 <b>${isUserNoteReferenceEnabled() ? "ON" : "OFF"}</b></button>`,
@@ -5083,6 +5099,9 @@ ${JSON.stringify({kind:"rp_user_note",content})}` : "";
 
   function translationFlowHelp() {
     const mode=document.querySelector('input[name="cfg-trans-mode"]:checked')?.value || "only",settings=readCoreSelectionSettings();
+    if (!isMuseDialogueTranslationEnabled()) return mode === "write"
+      ? "현재 실행 순서 — 한국어 집필만\n① 현재 입력·최근 RP로 Core 자료를 선별해요(선별 설정 ON일 때 AI 호출 발생).\n② PC의 한국어 지문·대사를 집필하고 검증해요. 번역 모델·번역 지침·번역 출력 형식은 사용하지 않아요.\n③ 검증된 한국어 본문만 입력창에 적용하고 전송은 직접 눌러요.\n\nCore 선별이 없으면 집필 AI 1회가 기본이며 번역 AI 호출은 0회예요. 집필 실패나 입력 변경 시 원문을 유지해요."
+      : "대사 번역이 OFF인 번역만 모드에서는 실행할 작업이 없어요. 한국어 RP를 집필하려면 ‘집필 후 번역’을 선택한 뒤 OFF를 유지해 주세요.";
     return `PC 능력은 설정집에서 방·분기별로 저장해요. 활성화된 기본 능력 설정과 상시·패시브 기술은 매번 참고하고, 일반 기술만 현재 입력의 키워드로 호출하며 필요한 필수 참고도 함께 전달해요. 별도 AI 선별 호출은 없어요. Wish Core 선별과 별개이고 같은 능력 자료를 집필·번역에 재사용해요.
 
 현재 실행 순서 — ${mode === "write" ? "집필 후 번역" : "번역만"}
@@ -5180,9 +5199,21 @@ Core OFF·두 선별 옵션 OFF·후보 없음이면 추가 Core 선별 없이 �
     const desc = document.getElementById("trans-mode-desc");
     if (!desc) return;
     const mode = document.querySelector('input[name="cfg-trans-mode"]:checked')?.value || "only";
-    const settings = readCoreSelectionSettings(), enabled = isWishCoreReferenceEnabled() && (settings.relevance || settings.priority);
-    desc.innerText = (mode === "write" ? "한국어 집필 후 별도 요청으로 대사만 번역해요." : "입력의 뜻·행동·대사를 유지하며 번역해요.") +
-      (enabled ? (mode === "write" ? ` Core AI 선별 사용 · 보통 API 3회. 자료가 많으면 선별 호출이 늘어날 수 있어요.` : ` Core AI 선별 사용 · 보통 API 2회. 자료가 많으면 선별 호출이 늘어날 수 있어요.`) : (mode === "write" ? ` 대사가 있으면 보통 API 2회.` : ` API 1회.`));
+    const translationEnabled = isMuseDialogueTranslationEnabled();
+    const state = document.getElementById("cfg-dialogue-translation-state");
+    if (state) state.textContent = translationEnabled ? "ON" : "OFF";
+    const settings = readCoreSelectionSettings(), coreSelection = isWishCoreReferenceEnabled() && (settings.relevance || settings.priority);
+    if (!translationEnabled) {
+      desc.innerText = mode === "write"
+        ? "한국어 PC 집필만 실행해요. 대사 번역 AI 호출은 0회예요." + (coreSelection ? " Core AI 선별은 별도로 호출될 수 있어요." : " 집필 AI 1회가 기본이에요.")
+        : "번역만 + 대사 번역 OFF에서는 실행할 작업이 없어요. 한국어 집필은 ‘집필 후 번역’을 선택해 주세요.";
+    } else {
+      desc.innerText = (mode === "write" ? "한국어 집필 후 별도 요청으로 대사만 번역해요." : "입력의 뜻·행동·대사를 유지하며 번역해요.") +
+        (coreSelection ? (mode === "write" ? ` Core AI 선별 사용 · 보통 API 3회. 자료가 많으면 선별 호출이 늘어날 수 있어요.` : ` Core AI 선별 사용 · 보통 API 2회. 자료가 많으면 선별 호출이 늘어날 수 있어요.`) : (mode === "write" ? ` 대사가 있으면 보통 API 2회.` : ` API 1회.`));
+    }
+    const run = document.getElementById("cmw-trans-run");
+    if (run) run.textContent = mode === "write" ? (translationEnabled ? "집필 후 대사 번역 실행" : "한국어 집필 실행") : (translationEnabled ? "입력창 번역 실행" : "번역 OFF · 집필 모드 선택");
+    syncMuseBusyUI();
   }
 
   function toggleTransCustomLangUI() {
@@ -6278,6 +6309,10 @@ Core OFF·두 선별 옵션 OFF·후보 없음이면 추가 Core 선별 없이 �
     initMuseOocEvents();
     initMuseAbilityEvents();
     document.getElementById("cmw-trans-run")?.addEventListener("click", runMuseTranslation);
+    document.getElementById("cfg-dialogue-translation-enabled")?.addEventListener("change", event => {
+      GM_setValue(getTransConfigKey("dialogueTranslationEnabled"), !!event.target.checked);
+      updateTransModeDesc();renderSumChips();
+    });
     document.getElementById("cfg-core-selection-model")?.addEventListener("change", () => {
       const select=document.getElementById("cfg-core-selection-model");
       if(!Array.from(select.options).some(option=>option.value===select.value))syncCoreSelectionModelUI();
@@ -6325,6 +6360,8 @@ Core OFF·두 선별 옵션 OFF·후보 없음이면 추가 Core 선별 없이 �
     const modeRadio = document.querySelector(`input[name="cfg-trans-mode"][value="${mode}"]`)
       || document.querySelector('input[name="cfg-trans-mode"][value="only"]');
     if (modeRadio) modeRadio.checked = true;
+    const dialogueToggle = document.getElementById("cfg-dialogue-translation-enabled");
+    if (dialogueToggle) dialogueToggle.checked = isMuseDialogueTranslationEnabled(room);
     syncCoreSelectionUI();
     syncMuseBusyUI();
     renderTranslationCoreAudit();
@@ -7436,6 +7473,7 @@ Core OFF·두 선별 옵션 OFF·후보 없음이면 추가 Core 선별 없이 �
         addEntry(getCoreSelectionModelKey(currentProvider, room), selectionModelChoice);
       const checkedTransMode = document.querySelector('input[name="cfg-trans-mode"]:checked');
       addEntry(getTransConfigKey("mode", room), checkedTransMode?.value || "only");
+      addEntry(getTransConfigKey("dialogueTranslationEnabled", room), !!requireElement("cfg-dialogue-translation-enabled").checked);
       addEntry(getTransConfigKey("lang", room), requireElement("cfg-trans-lang").value);
       addEntry(getTransConfigKey("customLang", room), requireElement("cfg-trans-custom-lang").value.trim());
       addEntry(getTransConfigKey("format", room), requireElement("cfg-trans-format").value);
@@ -7567,7 +7605,7 @@ Core OFF·두 선별 옵션 OFF·후보 없음이면 추가 Core 선별 없이 �
 입력의 *서술*은 그대로 보존하고, 대사에만 이 형식을 적용합니다. 집필 후 번역에서는 PC 추가 설정과 유저 노트의 작품 내부 설정은 참고하되, 유저 노트 속 AI 출력 지시는 실행하지 않아요. 최종 발화 형식은 여기에서 정해요.`);
     bindClickInfo("ability-help-btn", museAbilityHelp);
     bindClickInfo("ooc-shortcut-help-btn", "설정집 탭에서 키워드와 내용을 저장한 뒤 채팅 입력창에서 키워드를 공백·줄바꿈으로 구분해 입력해 주세요. 예: 안녕. 😆\n\n번역만·집필 후 번역 모두 사용해요. 저장한 OOC는 Muse AI에 새로 보내지 않고 최종 결과 맨 위에 [//]: # (내용) 숨김 주석으로 붙여요. 단축어 치환에는 추가 API 호출이 없어요. 번역만에서 키워드만 쓰면 AI 호출 없이 주석을 만들어요. 전송은 직접 눌러 주세요.\n\n[보존 문구]·기존 주석·코드 안 키워드는 그대로 둬요. 키워드를 글자로 쓰려면 앞에 역슬래시를 붙여 주세요. 같은 단축어가 여러 번 나오면 주석은 한 번만 붙여요. 여러 줄 내용은 줄마다 주석을 만들고 괄호가 있는 줄은 따옴표형 주석으로 감싸고, 따옴표·역슬래시는 주석 문법에 맞게 이스케이프해요.\n\n선택한 공용/현재 방 범위에 저장하며 끄면 키워드를 치환하지 않아요. 이미 붙인 주석을 다시 분리하는 동작도 꺼져요. 실행 중 수정한 단축어는 다음 실행부터 적용됩니다.");
-    bindClickInfo("core-selection-model-help-btn", "Core 선별 모델은 집필·번역 모델과 별개예요. 기존 자동 선택을 유지하면 Gemini 계열은 3.1 Flash-Lite, DeepSeek은 V4 Flash로 동작해요.\n\n집필·번역 모델과 동일을 선택해도 선별은 별도의 낮은 추론 설정을 사용해요(Gemini 4 Argon·3.8/3.7 Flash·3.1 Pro는 Low, 지원하는 그 밖의 Gemini 3.x는 Minimal, DeepSeek은 Off, Gemini 2.5는 128 토큰 예산).\n\nAPI 제공자별·방/분기별로 저장되고, 기존 병렬 실행 한도는 그대로 4개예요. 모델을 바꿔도 서버 측 429나 할당량 문제가 반드시 해결되지는 않아요.");
+    bindClickInfo("core-selection-model-help-btn", "Core 선별 모델은 집필·번역 모델과 별개예요. 기존 자동 선택을 유지하면 Gemini 계열은 3.1 Flash-Lite, DeepSeek은 V4 Flash로 동작해요.\n\n집필·번역 모델과 동일을 선택해도 선별은 별도의 낮은 추론 설정을 사용해요(Gemini 4 Argon·Carbon·3.8/3.7 Flash·3.1 Pro는 Low, 지원하는 그 밖의 Gemini 3.x는 Minimal, DeepSeek은 Off, Gemini 2.5는 128 토큰 예산).\n\nAPI 제공자별·방/분기별로 저장되고, 기존 병렬 실행 한도는 그대로 4개예요. 모델을 바꿔도 서버 측 429나 할당량 문제가 반드시 해결되지는 않아요.");
     bindClickInfo("core-relevance-help-btn", "관련성 확인\n자료집은 저장된 짧은 요약·키워드로 선별 부담을 줄이고, 선택한 전문은 집필·번역에 전달해요. 짧은 요약이 없는 자료와 중요한 대사·현재상태·인지·호칭은 전문으로 선별해요. 키워드가 없는 후보도 유지합니다. 요약에서 빠진 정황을 놓칠 가능성은 있어요.\n\n현재 입력과 최근 실제 RP에서 인물 관계·관련 과거 사건·호칭·인지·배경을 평가해 필요한 Core 자료를 골라요. 집필 후 번역에서는 집필 전에 실행하고 선별 결과를 집필과 후속 번역에 동일하게 전달해요.\n\n미체크 자료도 자동 검색 ON: 체크 여부와 무관하게 전체 후보를 검색하고 직접 선택 모드의 체크 자료는 고정 포함해요. OFF: 기존 전체/직접 선택 범위만 검색해요. Core 반영 OFF는 자료 사용을 중단합니다.\n\n우선순위도 ON이면 같은 요청에서 처리해요. 배치마다 AI 1회가 추가되며 선별 실패 시 사유를 표시하고 원문을 유지하며 작업을 중단해요.");
     bindClickInfo("core-priority-help-btn", "우선순위 정하기\n현재 입력과 최근 실제 RP로 자료의 중요도를 평가해 요청에 넣을 순서를 정해요. 동점은 기존 순서를 유지합니다.\n\n관련성 ON이면 관련 자료를 골라 정렬하고, OFF이면 후보 전체를 정렬합니다. 자동 검색 ON에서 직접 체크한 자료는 관련성 점수와 무관하게 포함됩니다. 두 선별 옵션이 OFF이면 추가 Core 선별 없이 진행해요.\n\n집필 후 번역은 집필 전에 선별하고, 같은 결과를 집필과 번역에 전달합니다. 옵션마다 따로 호출하지 않아요.");
     document.addEventListener("keydown", (e) => { if (e.key === "Escape") closeClickInfo(); });
@@ -9328,7 +9366,7 @@ ${conversation}`;
       const selectedModel=normalizeModelId(options.model || GM_getValue("cfgModel","gemini-3.1-pro-preview"));
       const selectedProvider=options.provider || GM_getValue("apiProvider","google");
       const timeoutMs=selectedProvider==="gpt_subscription" ? MUSE_GPT_WAIT_MS : Number.isFinite(options.timeoutMs)&&options.timeoutMs>0?options.timeoutMs:
-        (isMuseArgon(selectedModel)?MUSE_ARGON_REQUEST_TIMEOUT:(kind==="selection"?MUSE_REQUEST_LIMITS.selection:MUSE_REQUEST_LIMITS.translation));
+        (isMuseArgonOrCarbon(selectedModel)?MUSE_ARGON_REQUEST_TIMEOUT:(kind==="selection"?MUSE_REQUEST_LIMITS.selection:MUSE_REQUEST_LIMITS.translation));
       const diagnostic=museDiagnosticRequest(options,kind,sysPrompt,userContent,timeoutMs);
       let settled=false,lifetime;
       const resolve=value=>{if(settled)return;try{options.assertCurrent?.();}catch(error){reject(error);return;}settled=true;lifetime.finish();museDiagnosticRequestEvent(diagnostic,"요청 완료",{outputChars:String(value || "").length});resolveResult(value);};
@@ -9571,7 +9609,7 @@ JSON {"scores":[{"id":0,"related":true,"relevance":90}]}만 출력한다.`;
       museDiagnosticEvent(engine.diagnosticRun,"Core 선별","선별 모델 확정",{choice:selectionEngine.selectionChoice,model:selectionEngine.model,thinking:selectionEngine.thinkingValue,parallelLimit:selectionConcurrency});
       const candidates = buildMuseCoreSelectionCandidates(entries, source, history);
       const pinned = settings.autoCandidates !== false && getWishCoreReferenceMode() === "selected" ? selectedWishCoreKeys() : new Set();
-      const selectionTimeBudget=selectionEngine.provider==="gpt_subscription"?MUSE_GPT_WAIT_MS:(isMuseArgon(selectionEngine.model)||isMuseArgon(selectionEngine.primaryModel))?MUSE_ARGON_REQUEST_TIMEOUT:MUSE_REQUEST_LIMITS.selection;
+      const selectionTimeBudget=selectionEngine.provider==="gpt_subscription"?MUSE_GPT_WAIT_MS:(isMuseArgonOrCarbon(selectionEngine.model)||isMuseArgonOrCarbon(selectionEngine.primaryModel))?MUSE_ARGON_REQUEST_TIMEOUT:MUSE_REQUEST_LIMITS.selection;
       const batches = buildCoreSelectionBatches(candidates, source, history, selectionEngine.model), batchScores = new Array(batches.length), selectAt = Date.now(), deadline = selectAt + MUSE_REQUEST_LIMITS.sdkPreparation + Math.ceil(batches.length/selectionConcurrency)*selectionTimeBudget + 1000;
       let nextBatch = 0, completed = 0, failure = null, usePrimarySelectionEngine = false;
       const batchController=typeof AbortController === "function"?new AbortController():null;
@@ -9593,16 +9631,16 @@ JSON {"scores":[{"id":0,"related":true,"relevance":90}]}만 출력한다.`;
             const primarySelectionEngine = {...selectionEngine,model:selectionEngine.primaryModel,
               thinkingValue:getMuseCoreSelectionThinkingValue(selectionEngine.provider,selectionEngine.primaryModel)};
             if (usePrimarySelectionEngine) {
-              raw = await requestTranslationLLM(CORE_SELECTION_PROMPT, JSON.stringify(requestArgs), {...primarySelectionEngine,...common,timeoutMs:Math.min(isMuseArgon(selectionEngine.primaryModel)?MUSE_ARGON_REQUEST_TIMEOUT:MUSE_REQUEST_LIMITS.selection,deadline-Date.now())});
+              raw = await requestTranslationLLM(CORE_SELECTION_PROMPT, JSON.stringify(requestArgs), {...primarySelectionEngine,...common,timeoutMs:Math.min(isMuseArgonOrCarbon(selectionEngine.primaryModel)?MUSE_ARGON_REQUEST_TIMEOUT:MUSE_REQUEST_LIMITS.selection,deadline-Date.now())});
             } else try {
-              raw = await requestTranslationLLM(CORE_SELECTION_PROMPT, JSON.stringify(requestArgs), {...selectionEngine,...common,timeoutMs:Math.min(isMuseArgon(selectionEngine.model)?MUSE_ARGON_REQUEST_TIMEOUT:MUSE_REQUEST_LIMITS.selection,deadline-Date.now())});
+              raw = await requestTranslationLLM(CORE_SELECTION_PROMPT, JSON.stringify(requestArgs), {...selectionEngine,...common,timeoutMs:Math.min(isMuseArgonOrCarbon(selectionEngine.model)?MUSE_ARGON_REQUEST_TIMEOUT:MUSE_REQUEST_LIMITS.selection,deadline-Date.now())});
             } catch (error) {
               assertSelection();
               if (selectionEngine.independent || selectionEngine.provider === "gpt_subscription" || !shouldRetryCoreSelectionWithPrimary(error)) throw error;
               if (selectionEngine.model === selectionEngine.primaryModel) throw error; // 같은 모델에 무의미한 재호출을 하지 않는다.
               usePrimarySelectionEngine = true;
               museDiagnosticEvent(engine.diagnosticRun,"Core 선별","레거시 자동 선별 모델 미지원 · 같은 제공자의 주 모델로 재시도",{selectedModel:selectionEngine.model,primaryModel:selectionEngine.primaryModel});
-              raw = await requestTranslationLLM(CORE_SELECTION_PROMPT, JSON.stringify(requestArgs), {...primarySelectionEngine,...common,timeoutMs:Math.min(isMuseArgon(selectionEngine.primaryModel)?MUSE_ARGON_REQUEST_TIMEOUT:MUSE_REQUEST_LIMITS.selection,deadline-Date.now())});
+              raw = await requestTranslationLLM(CORE_SELECTION_PROMPT, JSON.stringify(requestArgs), {...primarySelectionEngine,...common,timeoutMs:Math.min(isMuseArgonOrCarbon(selectionEngine.primaryModel)?MUSE_ARGON_REQUEST_TIMEOUT:MUSE_REQUEST_LIMITS.selection,deadline-Date.now())});
             }
             assertSelection();
             batchScores[i] = validateCoreScores(raw, batches[i]);
@@ -10195,7 +10233,10 @@ JSON {"scores":[{"id":0,"related":true,"relevance":90}]}만 출력한다.`;
   function syncMuseBusyUI() {
     const busy = !!museOperation;
     const run = document.getElementById("cmw-trans-run");
-    if (run) { run.disabled = busy; run.setAttribute("aria-busy", String(busy)); }
+    if (run) {
+      run.disabled = busy || (GM_getValue(getTransConfigKey("mode"), "only") === "only" && !isMuseDialogueTranslationEnabled());
+      run.setAttribute("aria-busy", String(busy));
+    }
   }
   function syncPcDelegationButton() {
     const button = document.getElementById("crack-pure-delegation-btn");
@@ -10212,6 +10253,9 @@ JSON {"scores":[{"id":0,"related":true,"relevance":90}]}만 출력한다.`;
     const input = getChatInput();
     if (!input) return showMuseToast("채팅 입력창을 찾을 수 없어요.", "warning", 2700);
     const baseText = chatInputText(input), mode = GM_getValue(getTransConfigKey("mode"), "only");
+    const dialogueTranslationEnabled = isMuseDialogueTranslationEnabled();
+    if (mode === "only" && !dialogueTranslationEnabled)
+      return showMuseToast("대사 번역이 OFF예요. 한국어 집필은 ‘집필 후 번역’을 선택해 주세요.", "warning", 2700);
     if (mode === "only" && !baseText.trim()) return showMuseToast("번역할 텍스트를 먼저 입력해 주세요.", "warning", 2700);
     const operation = beginMuseOperation(input), delegation = readPcDelegationSettings(), selection = readCoreSelectionSettings();
     const engine = {provider:GM_getValue("apiProvider", "google"),model:normalizeModelId(GM_getValue("cfgModel", "gemini-3.1-pro-preview"))};
@@ -10227,7 +10271,7 @@ JSON {"scores":[{"id":0,"related":true,"relevance":90}]}만 출력한다.`;
     };
     syncMuseBusyUI();
     translationCoreAudits.delete(operation.scope);
-    setTranslationCoreAudit(operation.scope, {status:mode === "write" ? "집필 중 · 번역 요청 전" : "번역 준비 중 · 번역 요청 전", rows:[]});
+    setTranslationCoreAudit(operation.scope, {status:mode === "write" ? (dialogueTranslationEnabled ? "집필 중 · 번역 요청 전" : "한국어 집필 중 · 번역 OFF") : "번역 준비 중 · 번역 요청 전", rows:[]});
     try {
       const shortcut = parseMuseOocShortcuts(baseText);
       const preservation = parseMuseLocks(shortcut.text);
@@ -10247,8 +10291,10 @@ JSON {"scores":[{"id":0,"related":true,"relevance":90}]}만 출력한다.`;
         if (result!==baseText) applyMuseResult(operation,result);
         operation.timing.status="완료";progress("번역할 대사가 없어 서술 원문을 유지했어요.");return;
       }
-      translationEngine=readMuseStageEngine("translation",engine,operation.room);
-      operation.translationPreset = captureMuseTranslationPreset(operation.scope);
+      if (dialogueTranslationEnabled) {
+        translationEngine=readMuseStageEngine("translation",engine,operation.room);
+        operation.translationPreset = captureMuseTranslationPreset(operation.scope);
+      }
       const preparedWriterContext = mode === "write"
         ? prepareMuseWriterPrerequisites(operation.room,{assertCurrent:()=>assertMuseOperation(operation)})
         : null;
@@ -10260,10 +10306,10 @@ JSON {"scores":[{"id":0,"related":true,"relevance":90}]}만 출력한다.`;
         // 5.2.52 flow restored: produce/validate a Korean PC turn FIRST; then
         // translate only its dialogue in a separate request. Neither an
         // intermediate draft nor a failed translation is applied to the input.
-        const format = getTransFormatTemplate();
+        const format = dialogueTranslationEnabled ? getTransFormatTemplate() : null;
         progress(reference.text ? "선별한 Core를 참고해 PC 집필 중…" : "PC 집필 중…");
         const requestDraft=(strictDraftRetry=false)=>callGemini(shortcut.text,{
-          preservation,delegation,...engine,translationDraft:true,strictDraftRetry,
+          preservation,delegation,...engine,translationDraft:true,koreanOnly:!dialogueTranslationEnabled,strictDraftRetry,
           coreReference:reference,preparedWriterContext,abilityReference,onTiming,
           assertCurrent:()=>assertMuseOperation(operation),
           onRequestStarted:()=>setTranslationCoreAudit(operation.scope,{
@@ -10284,28 +10330,37 @@ JSON {"scores":[{"id":0,"related":true,"relevance":90}]}만 출력한다.`;
           }
           assertMuseOperation(operation);
         } finally {onTiming("한국어 집필",Date.now()-draftAt);}
-        // Preserve only a validated and fully lock-restored draft. The translation
-        // stage must not rewrite narration, thoughts, PC choices, or Korean text.
-        writeTranslationSkipped = buildTranslationPlan(source,format).dialogues.length === 0;
-        progress(writeTranslationSkipped
-          ? "한국어 집필 완료 · 번역할 대사가 없어 번역 AI 호출을 생략해요."
-          : "한국어 집필 완료 · 대사만 별도 번역 중…");
-        const translateAt=Date.now();
-        try {
-          result=await callTranslate(source,{
-            preservationParsed:true,generatedDraft:true,format,engine:translationEngine,reference,abilityReference,
-            room:operation.room,assertCurrent:()=>assertMuseOperation(operation),onProgress:progress
-          });
-          assertMuseOperation(operation);
+        // The Korean draft is already validated and lock-restored. OFF keeps it
+        // unchanged; ON retains the original independent translation pipeline.
+        if (!dialogueTranslationEnabled) {
+          result = source;
           setTranslationCoreAudit(operation.scope,{
-            started:!writeTranslationSkipped,
-            draftStarted:true,
-            status:writeTranslationSkipped ? "집필 확정 · 대사 없음 · 번역 AI 호출 생략" : "집필 확정 · 별도 대사 번역 검증 완료",
-            rows:writeTranslationSkipped ? [] : (reference.text ? reference.rows : []),
-            reason:writeTranslationSkipped ? "번역할 대사 없음 · 번역 AI 호출 없음" : reference.reason,
+            started:false,draftStarted:true,status:"한국어 집필 확정 · 대사 번역 OFF · 번역 AI 호출 없음",
+            rows:[],reason:"대사 번역 OFF · 번역 AI 호출 없음",
             draftRows:reference.rows,draftReason:reference.reason
           });
-        } finally {if (!writeTranslationSkipped) onTiming("번역",Date.now()-translateAt);}
+        } else {
+          writeTranslationSkipped = buildTranslationPlan(source,format).dialogues.length === 0;
+          progress(writeTranslationSkipped
+            ? "한국어 집필 완료 · 번역할 대사가 없어 번역 AI 호출을 생략해요."
+            : "한국어 집필 완료 · 대사만 별도 번역 중…");
+          const translateAt=Date.now();
+          try {
+            result=await callTranslate(source,{
+              preservationParsed:true,generatedDraft:true,format,engine:translationEngine,reference,abilityReference,
+              room:operation.room,assertCurrent:()=>assertMuseOperation(operation),onProgress:progress
+            });
+            assertMuseOperation(operation);
+            setTranslationCoreAudit(operation.scope,{
+              started:!writeTranslationSkipped,
+              draftStarted:true,
+              status:writeTranslationSkipped ? "집필 확정 · 대사 없음 · 번역 AI 호출 생략" : "집필 확정 · 별도 대사 번역 검증 완료",
+              rows:writeTranslationSkipped ? [] : (reference.text ? reference.rows : []),
+              reason:writeTranslationSkipped ? "번역할 대사 없음 · 번역 AI 호출 없음" : reference.reason,
+              draftRows:reference.rows,draftReason:reference.reason
+            });
+          } finally {if (!writeTranslationSkipped) onTiming("번역",Date.now()-translateAt);}
+        }
       } else {
         assertMuseOperation(operation);progress("번역 준비 중…");
         const translateAt=Date.now();
@@ -10319,21 +10374,23 @@ JSON {"scores":[{"id":0,"related":true,"relevance":90}]}만 출력한다.`;
       museGptAcknowledge(operation.bridgeOwner);
       if (mode === "write") consumePcDelegationFixed(delegation);
       operation.timing.status="완료";
-      progress(writeTranslationSkipped
-        ? (shortcut.comments.length ? "집필 완료 · 대사 없어 번역 생략 · OOC 숨김 주석과 함께 입력창에 적용했어요." : "집필 완료 · 대사 없어 번역 생략 · 입력창에 적용했어요.")
-        : (shortcut.comments.length ? "번역 완료 · OOC 숨김 주석과 함께 입력창에 적용했어요." : "번역 완료 · 입력창에 적용했어요."));
+      progress(mode === "write" && !dialogueTranslationEnabled
+        ? (shortcut.comments.length ? "한국어 집필 완료 · 번역 OFF · OOC 숨김 주석과 함께 입력창에 적용했어요." : "한국어 집필 완료 · 번역 OFF · 입력창에 적용했어요.")
+        : writeTranslationSkipped
+          ? (shortcut.comments.length ? "집필 완료 · 대사 없어 번역 생략 · OOC 숨김 주석과 함께 입력창에 적용했어요." : "집필 완료 · 대사 없어 번역 생략 · 입력창에 적용했어요.")
+          : (shortcut.comments.length ? "번역 완료 · OOC 숨김 주석과 함께 입력창에 적용했어요." : "번역 완료 · 입력창에 적용했어요."));
     } catch (error) {
       operation.timing.status="중단";
       const audit = translationCoreAudits.get(operation.scope);
-      if (!audit || ["집필 중 · 번역 요청 전", "번역 준비 중 · 번역 요청 전"].includes(audit.status)) setTranslationCoreAudit(operation.scope, {status:"번역 요청 전 중단 · 전달된 Core 자료 없음", rows:[], reason:humanizeMuseError(error)});
+      if (!audit || ["집필 중 · 번역 요청 전", "한국어 집필 중 · 번역 OFF", "번역 준비 중 · 번역 요청 전"].includes(audit.status)) setTranslationCoreAudit(operation.scope, {status:"번역 요청 전 중단 · 전달된 Core 자료 없음", rows:[], reason:humanizeMuseError(error)});
       const currentAudit = translationCoreAudits.get(operation.scope);
       if (currentAudit?.draftStarted && !currentAudit.started) setTranslationCoreAudit(operation.scope,{...currentAudit,status:"집필 단계 후 중단 · 번역 요청 전",reason:error.message || "집필 실패"});
       if (mode === "write" && currentAudit?.draftStarted) {
         setTranslationCoreAudit(operation.scope,{...currentAudit,
-          status:currentAudit.started ? "집필은 완료됐지만 번역 실패 · 원문 유지" : "한국어 집필 실패 또는 번역 전 중단 · 원문 유지",
+          status:!dialogueTranslationEnabled ? "한국어 집필 실패 · 원문 유지" : currentAudit.started ? "집필은 완료됐지만 번역 실패 · 원문 유지" : "한국어 집필 실패 또는 번역 전 중단 · 원문 유지",
           reason:humanizeMuseError(error)});
       }
-      progress(humanizeMuseError(error)); showMuseError(error, "번역 요청 실패");
+      progress(humanizeMuseError(error)); showMuseError(error, mode === "write" && !dialogueTranslationEnabled ? "한국어 집필 요청 실패" : "번역 요청 실패");
     }
     finally {
       operation.timing.finishedAt = Date.now();
@@ -10886,11 +10943,11 @@ ${abilityReference?.text ? "[능력 번역 참고]\n위의 [PC 능력·기술 �
       const writerModel=normalizeModelId(options.model || GM_getValue("cfgModel","gemini-3.1-pro-preview"));
       const writerProvider=options.provider || GM_getValue("apiProvider","google");
       const timeoutMs=writerProvider==="gpt_subscription"?MUSE_GPT_WAIT_MS:Number.isFinite(options.timeoutMs)&&options.timeoutMs>0?options.timeoutMs:
-        (isMuseArgon(writerModel)?MUSE_ARGON_REQUEST_TIMEOUT:MUSE_REQUEST_LIMITS.writer);
+        (isMuseArgonOrCarbon(writerModel)?MUSE_ARGON_REQUEST_TIMEOUT:MUSE_REQUEST_LIMITS.writer);
       diagnostic=museDiagnosticRequest(options,"writer","",baseText,timeoutMs);
       lifetime=createMuseRequestLifetime(options,reject);
       // Keep the original preparation guard; Argon's 20-minute allowance belongs to the AI response, not DOM/history preparation.
-      const prepareTimeoutMs=(writerProvider==="gpt_subscription"||isMuseArgon(writerModel))?Math.min(timeoutMs,MUSE_REQUEST_LIMITS.writer):timeoutMs;
+      const prepareTimeoutMs=(writerProvider==="gpt_subscription"||isMuseArgonOrCarbon(writerModel))?Math.min(timeoutMs,MUSE_REQUEST_LIMITS.writer):timeoutMs;
       lifetime.prepare(prepareTimeoutMs,`집필 준비가 ${Math.ceil(prepareTimeoutMs/1000)}초를 초과해 중단했어요. 원문을 유지했어요.`);
       const assertReady=()=>{if(settled)throw new Error("집필 요청이 종료되어 추가 호출을 중단했어요.");assertMuseCoreExclusions(exclusionState);assertMuseAbilityReference(abilityReference);options.assertCurrent?.();};
       (async () => {
@@ -11217,12 +11274,12 @@ ${styleInstruction}${delegationEnabled ? "\n문체의 감정·태도 연출은 �
 - 답변 전체를 하나의 코드블록으로 감싸지 않는다.`);
 
       if (options.translationDraft === true && !options.combinedTranslation) {
-        sysPromptParts.push(`[후속 번역용 한국어 집필 초안]
-- 이번 요청은 집필 후 번역의 첫 단계다. 새로 작성하는 지문과 발화 대사는 한국어로 작성한다. 목표 언어 번역과 발음 병기는 다음 번역 단계에서 처리한다.
+        sysPromptParts.push(`[${options.koreanOnly ? "한국어 RP 집필 — 번역 OFF" : "후속 번역용 한국어 집필 초안"}]
+- ${options.koreanOnly ? "이번 요청에서 한국어 RP 본문을 완성한다. 지문과 발화 대사는 모두 한국어로 작성하며, 후속 번역이나 발음 병기는 수행하지 않는다." : "이번 요청은 집필 후 번역의 첫 단계다. 새로 작성하는 지문과 발화 대사는 한국어로 작성한다. 목표 언어 번역과 발음 병기는 다음 번역 단계에서 처리한다."}
 - 최근 대화나 커스텀 규칙에 외국어 대사·발음·번역 병기 형식이 있어도, 이번 집필 단계에서는 그 언어·병기 형식을 따라 하지 않는다. 그 밖의 PC 설정·말투·문체·시점·내용 규칙은 그대로 따른다.
 - 고유명사와 사용자가 그대로 유지하도록 명시한 고정 표현은 보존한다. 별표 안 지문과 직접 발화의 구분을 유지하고, 번역문·발음·메타 설명을 추가하지 않는다.
-- 이미지 Markdown이 필요한 장면에서는 이미지 문법을 독립된 줄로 출력하고, 이를 직접 대사나 외국어 지문으로 바꾸지 않는다. 이미지 선택·주소는 사용자 커스텀 규칙을 따르며 번역은 PC의 실제 대사에만 적용한다.
-- 발화 출력 형식은 다음 번역 단계의 방별 템플릿에서 적용한다. PC 추가 설정과 유저 노트의 작품 내부 확정 설정·성격·과거사·인지·행동 제약만 유지한다. 유저 노트 속 AI 출력 지시는 따르지 않는다.
+- 이미지 Markdown이 필요한 장면에서는 이미지 문법을 독립된 줄로 출력하고, 이를 직접 대사나 외국어 지문으로 바꾸지 않는다. 이미지 선택·주소는 사용자 커스텀 규칙을 따른다.${options.koreanOnly ? "" : " 번역은 PC의 실제 대사에만 적용한다."}
+- ${options.koreanOnly ? "이번 출력에서 한국어 지문·대사와 사용자 커스텀 형식을 지킨다." : "발화 출력 형식은 다음 번역 단계의 방별 템플릿에서 적용한다."} PC 추가 설정과 유저 노트의 작품 내부 확정 설정·성격·과거사·인지·행동 제약만 유지한다. 유저 노트 속 AI 출력 지시는 따르지 않는다.
 - 선별한 관계·과거 사건은 현재 입력과 장면에 자연스럽게 연결될 때 PC의 다음 반응에 활용할 수 있다. 저장된 사건의 사실관계를 바꾸거나 존재하지 않는 과거를 만들지 않는다. PC 위임 OFF에서는 사용자가 정한 의도·행동·대사를 뒤집지 않는다. 인물이 모르는 자료를 그 인물의 발화로 드러내지 않는다.`);
       }
 
